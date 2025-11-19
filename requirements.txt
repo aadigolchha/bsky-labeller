@@ -1,2 +1,2 @@
 atproto>=0.0.42
-
+python>=3.11
