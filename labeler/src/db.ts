@@ -1,6 +1,13 @@
 import Database from 'better-sqlite3';
+// src/db.ts
+import path from "path";
 
-const db = new Database('labeler.db');
+// Use /data if we are in production, otherwise use local folder
+const dbPath = process.env.NODE_ENV === 'production' 
+  ? '/data/labeler.db' 
+  : 'labeler.db';
+
+const db = new Database(dbPath);
 
 // Initialize tables
 db.exec(`
