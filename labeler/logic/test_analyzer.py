@@ -3,13 +3,13 @@ from analyzer import app  # Import your app
 
 client = TestClient(app)
 
-def test_election_label():
+def test_election_news_label():
     response = client.post(
         "/analyze",
-        json={"text": "I saw a huge election today", "did": "did:plc:123"}
+        json={"text": "I saw a huge election news today", "did": "did:plc:123"}
     )
     assert response.status_code == 200
-    assert response.json() == {"label": "election-label", "score": 1.0, "text": "i saw a huge election today"}
+    assert response.json() == {"label": "election-label", "score": 1.0, "text": "i saw a huge election news today"}
 
 def test_vaccine_label():
     response = client.post(
