@@ -1,22 +1,27 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting Labeler System..."
-
-# 1. Start Python (FastAPI) in background
-# We use --uds to create the unix socket
-# --forwarded-allow-ips='*' is needed for some internal proxies, but UDS ignores it safely.
 echo "🐍 Starting Python Logic..."
-python3 -m uvicorn logic.analyzer:app --uds /tmp/analyzer.sock --workers 2 &
+# Start Python in background
+python3 -m uvicorn logic.analyzer:app --uds /tmp/analyzer.sock --workers 1 &
+PYTHON_PID=$!
 
-# 2. Wait for Python to wake up
 echo "⏳ Waiting for Python Socket..."
-while [ ! -S /tmp/analyzer.sock ]; do
+# Loop up to 30 times (3 seconds)
+for i in {1..30}; do
+  if [ -S /tmp/analyzer.sock ]; then
+    echo "✅ Socket found!"
+    break
+  fi
+  
+  # Check if Python is still running
+  if ! kill -0 $PYTHON_PID 2>/dev/null; then
+    echo "❌ Python process died! Check logs above."
+    exit 1
+  fi
+  
   sleep 0.1
 done
-echo "✅ Python is listening on /tmp/analyzer.sock"
 
-# 3. Start Node.js
 echo "🤖 Starting Node.js Server..."
-# We use 'exec' so Node takes over PID 1 (good for signal handling)
 exec npm start
