@@ -24,10 +24,10 @@ primary_region = "sjc"
     port = 443
     handlers = ["tls", "http"]
 
-  [[services.http_checks]]
-    interval = "10s"
-    timeout = "2s"
-    grace_period = "30s"
-    restart_limit = 0
-    method = "get"
-    path = "/"
+#  [[services.http_checks]]
+#    interval = "10s"
+#    timeout = "2s"
+#    grace_period = "30s"
+#    restart_limit = 0
+#    method = "get"
+#    path = "/"
