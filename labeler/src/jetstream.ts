@@ -59,7 +59,8 @@ export const startJetstream = (labeler: LabelerServer) => {
       if (result.label) {
         console.log(`[MATCH] Labeled ${did} as ${result.label}`);
         
-        labeler.emitLabel(did, result.label, cid);
+        // labeler.emitLabel(did, result.label, cid);
+        labeler.emitLabel(uri, result.label, cid);
         db.logLabel(uri, cid, result.label, text);
       }
     } catch (e) {

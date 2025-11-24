@@ -36,14 +36,14 @@ export class LabelerServer {
   }
 
   // The Main Event: Broadcast
-  async emitLabel(subjectDid: string, val: string, cid?: string) {
+  async emitLabel(uri: string, val: string, cid?: string) {
     if (!this.keypair) throw new Error("Server not started: No Keypair");
 
     const label = {
       ver: 1,
       src: this.did,
-      uri: subjectDid.startsWith("at://") ? subjectDid : `at://${subjectDid}/app.bsky.feed.post/${cid}`, // Simplification
-      cid: cid,
+      uri: uri,   // <--- USE THE EXACT URI PASSED IN
+      cid: cid,   // Optional: specific version
       val: val,
       neg: false,
       cts: new Date().toISOString(),
