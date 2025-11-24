@@ -1,5 +1,4 @@
 import { Jetstream } from "@skyware/jetstream";
-import WebSocket from "ws";
 import * as db from "./db.js";
 // import { broadcastLabel } from "./labeler-server.js"; 
 

@@ -1,6 +1,14 @@
 import express from "express";
 import http from "http";
 import dotenv from "dotenv";
+
+// --- NUCLEAR FIX START ---
+import WebSocket from "ws";
+// Force WebSocket to exist globally so Jetstream finds it automatically
+// @ts-ignore
+global.WebSocket = WebSocket;
+// --- NUCLEAR FIX END ---
+
 import { startJetstream } from "./jetstream.js";
 import { LabelerServer } from "./labeler-server.js";
 
