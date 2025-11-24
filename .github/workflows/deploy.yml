@@ -1,0 +1,22 @@
+name: Deploy Labeler
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'labeler/**' # Only deploy if files in this folder change
+
+jobs:
+  deploy:
+    name: Deploy app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        working-directory: ./labeler
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

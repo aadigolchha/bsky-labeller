@@ -1,0 +1,4 @@
+node_modules
+labeler.db
+dist
+.env

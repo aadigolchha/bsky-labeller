@@ -1,0 +1,33 @@
+app = "bluesky-labeler" 
+primary_region = "sjc"
+
+[build]
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+
+[mounts]
+  source = "labeler_data"
+  destination = "/data"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+  
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "10s"
+    restart_limit = 0
+    method = "get"
+    path = "/"
