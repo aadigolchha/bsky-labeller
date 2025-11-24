@@ -26,7 +26,7 @@ export class LabelerServer {
 
   // Handle the HTTP Upgrade (The "Traffic Cop")
   handleUpgrade(request: any, socket: any, head: any) {
-    if (request.url === "/xrpc/com.atproto.label.subscribeLabels") {
+    if (request.url.startsWith("/xrpc/com.atproto.label.subscribeLabels")) {
       this.wss.handleUpgrade(request, socket, head, (ws) => {
         this.wss.emit("connection", ws, request);
       });
