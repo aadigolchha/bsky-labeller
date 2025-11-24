@@ -18,6 +18,12 @@ const app = express();
 
 const server = http.createServer(app);
 
+// --- FIX: KEEP-ALIVE SETTINGS FOR FLY.IO---
+// Ensure Node waits longer than Fly's 60s proxy timeout
+server.keepAliveTimeout = 61 * 1000; // 61 seconds
+server.headersTimeout = 65 * 1000;   // 65 seconds (must be > keepAliveTimeout)
+// --------------------------------
+
 const PORT = parseInt(process.env.PORT || "8080", 10);
 
 const labeler = new LabelerServer(process.env.LABELER_DID || "");
