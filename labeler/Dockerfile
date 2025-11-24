@@ -16,9 +16,9 @@ COPY package*.json ./
 RUN npm install
 
 # 2. Install Python Deps
-COPY python/requirements.txt ./python/
+COPY logic/requirements.txt ./logic/
 # --break-system-packages is required in modern Debian/Docker environments
-RUN pip3 install -r python/requirements.txt --break-system-packages
+RUN pip3 install -r logic/requirements.txt --break-system-packages
 
 # 3. Copy App Code
 COPY . .

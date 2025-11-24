@@ -7,7 +7,7 @@ echo "🚀 Starting Labeler System..."
 # We use --uds to create the unix socket
 # --forwarded-allow-ips='*' is needed for some internal proxies, but UDS ignores it safely.
 echo "🐍 Starting Python Logic..."
-python3 -m uvicorn python.analyzer:app --uds /tmp/analyzer.sock --workers 2 &
+python3 -m uvicorn logic.analyzer:app --uds /tmp/analyzer.sock --workers 2 &
 
 # 2. Wait for Python to wake up
 echo "⏳ Waiting for Python Socket..."
