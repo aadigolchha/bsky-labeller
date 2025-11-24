@@ -3,7 +3,7 @@ set -e
 
 echo "🐍 Starting Python Logic..."
 # Start Python in background
-python3 -m uvicorn logic.analyzer:app --uds /tmp/analyzer.sock --workers 1 &
+python3 -m uvicorn logic.analyzer:app --uds /tmp/analyzer.sock --workers 1 --no-access-log &
 PYTHON_PID=$!
 
 echo "⏳ Waiting for Python Socket..."
