@@ -16,30 +16,6 @@ dotenv.config();
 
 const app = express();
 
-// --- NEW DID:WEB ROUTE ---
-app.get("/.well-known/did.json", (req, res) => {
-    res.json({
-      "@context": ["https://www.w3.org/ns/did/v1"],
-      "id": "did:web:bluesky-labeler.fly.dev", // <--- UPDATE DOMAIN IF NEEDED
-      "verificationMethod": [
-        {
-          "id": "did:web:bluesky-labeler.fly.dev#atproto",
-          "type": "Multikey",
-          "controller": "did:web:bluesky-labeler.fly.dev",
-          "publicKeyMultibase": "zQ3shnktTZyBJyboTXaV9XddXsBvzwGwvL383BzrzW7yy36AT"
-        }
-      ],
-      "service": [
-        {
-          "id": "#atproto_labeler",
-          "type": "AtprotoLabeler",
-          "serviceEndpoint": "wss://bluesky-labeler.fly.dev" // <--- UPDATE DOMAIN
-        }
-      ]
-    });
-  });
-  // -------------------------
-
 const server = http.createServer(app);
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
