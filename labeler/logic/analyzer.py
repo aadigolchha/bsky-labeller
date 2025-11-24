@@ -15,11 +15,14 @@ async def analyze(payload: PostPayload):
     # YOUR LOGIC GOES HERE
     text = payload.text.lower()
     
-    if "election news" in text:
+    #if "election news" in text:
+    #    return {"label": "election-label", "score": 1.0, "text": text}
+
+    if "nishka" in text:
         return {"label": "election-label", "score": 1.0, "text": text}
 
-    if "vaccine" in text:
-        return {"label": "vaccine-label", "score": 1.0, "text": text}
+    #if "vaccine" in text:
+    #    return {"label": "vaccine-label", "score": 1.0, "text": text}
     
     return {"label": None}
 
