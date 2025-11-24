@@ -43,10 +43,11 @@ export class LabelerServer {
       ver: 1,
       src: this.did,
       uri: uri,   // <--- USE THE EXACT URI PASSED IN
-      cid: cid,   // Optional: specific version
+      // cid: cid,   // Optional: specific version
       val: val,
       neg: false,
       cts: new Date().toISOString(),
+      ...(cid && { cid }),
     };
 
     // Sign and Encode
