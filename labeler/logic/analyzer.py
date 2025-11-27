@@ -412,20 +412,44 @@ class MisinformationAnalyzer:
         return clusters
 
     def _extract_keywords(self, notes: List[CommunityNote]) -> List[str]:
-        """Extract common keywords from cluster notes."""
-        # Simple keyword extraction from summaries
-        word_counts: Dict[str, int] = defaultdict(int)
-        stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'this', 'that', 'it', 'to', 'of', 'and', 'in', 'for', 'on', 'with', 'as', 'by', 'at', 'from', 'or', 'be', 'not', 'has', 'have', 'had', 'but', 'they', 'their', 'there', 'these', 'those', 'which', 'who', 'what', 'when', 'where', 'why', 'how'}
+        """Extract keywords using LLM to identify topic-specific terms."""
+        if not notes:
+            return []
 
-        for note in notes:
-            words = re.findall(r'\b[a-zA-Z]{4,}\b', note.summary.lower())
-            for word in words:
-                if word not in stop_words:
-                    word_counts[word] += 1
+        # Sample summaries for LLM analysis
+        sample_summaries = [n.summary for n in notes[:5]]
+        summaries_text = "\n".join(f"- {s[:200]}" for s in sample_summaries)
 
-        # Return top keywords
-        sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
-        return [word for word, count in sorted_words[:10] if count >= 2]
+        prompt = f"""Extract 5-8 specific keywords/phrases that identify this misinformation topic.
+
+Community Notes summaries:
+{summaries_text}
+
+Return ONLY specific, distinctive terms that would appear in posts spreading this misinformation.
+Do NOT include generic words like: post, video, image, claim, people, time, says, said, etc.
+Focus on: names, places, specific claims, technical terms, unique phrases.
+
+Return as comma-separated list, lowercase. Example: vaccine microchip, 5g towers, bill gates"""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=CONFIG.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "Extract specific misinformation topic keywords. Be very selective - only terms that clearly indicate this specific topic."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=100
+            )
+
+            keywords_text = response.choices[0].message.content.strip().lower()
+            keywords = [k.strip() for k in keywords_text.split(',') if k.strip()]
+            logger.info(f"Extracted keywords: {keywords}")
+            return keywords[:8]
+
+        except Exception as e:
+            logger.error(f"Keyword extraction failed: {e}")
+            return []
 
     def _generate_theme(self, notes: List[CommunityNote]) -> str:
         """Generate a theme description for the cluster."""
