@@ -1,20 +1,33 @@
-app = "bluesky-labeler" 
+# Fly.io Configuration for Bluesky Misinformation Labeler
+# https://fly.io/docs/reference/configuration/
+
+app = "bluesky-labeler"
 primary_region = "sjc"
 
 [build]
+  # Uses Dockerfile in current directory
 
 [env]
   PORT = "8080"
   NODE_ENV = "production"
+  # NOTES_FILE is set to use volume mount
+  NOTES_FILE = "/app/logic/notes-00000.tsv"
+  # Adjust these based on your needs
+  MAX_NOTES = "1000"
+  SIMILARITY_THRESHOLD = "0.45"
+  HIGH_CONFIDENCE_THRESHOLD = "0.70"
 
+# Persistent storage for database, cache, and Community Notes
 [mounts]
   source = "labeler_data"
   destination = "/data"
 
+# HTTP service configuration
 [[services]]
   protocol = "tcp"
   internal_port = 8080
   
+  # Public ports
   [[services.ports]]
     port = 80
     handlers = ["http"]
@@ -24,10 +37,30 @@ primary_region = "sjc"
     port = 443
     handlers = ["tls", "http"]
 
-#  [[services.http_checks]]
-#    interval = "10s"
-#    timeout = "2s"
-#    grace_period = "30s"
-#    restart_limit = 0
-#    method = "get"
-#    path = "/"
+  # Health checks - give time for embedding initialization
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 50
+
+  # WebSocket keepalive
+  [[services.http_checks]]
+    interval = "30s"
+    timeout = "10s"
+    grace_period = "180s"  # 3 minutes for initial embedding generation
+    method = "GET"
+    path = "/"
+
+# Machine configuration
+# Upgrade if you need more memory for large Community Notes datasets
+[vm]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# Secrets (set via `fly secrets set`):
+# - OPENAI_API_KEY: Your OpenAI API key
+# - LABELER_DID: Your Bluesky DID (did:plc:...)
+# - LABELER_PRIVATE_KEY: Private key for label signing
+# - BSKY_HANDLE: Your Bluesky handle (for publish-labels.ts)
+# - BSKY_PASSWORD: Your Bluesky app password
