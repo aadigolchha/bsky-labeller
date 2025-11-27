@@ -14,6 +14,20 @@ import { LabelerServer } from "./labeler-server.js";
 
 dotenv.config();
 
+// Validate required environment variables
+const LABELER_DID = process.env.LABELER_DID;
+const LABELER_PRIVATE_KEY = process.env.LABELER_PRIVATE_KEY;
+
+if (!LABELER_DID || !LABELER_DID.startsWith('did:')) {
+  console.error("❌ FATAL: LABELER_DID must be set and start with 'did:' in .env");
+  process.exit(1);
+}
+
+if (!LABELER_PRIVATE_KEY) {
+  console.error("❌ FATAL: LABELER_PRIVATE_KEY must be set in .env");
+  process.exit(1);
+}
+
 const app = express();
 
 const server = http.createServer(app);
@@ -26,7 +40,7 @@ server.headersTimeout = 65 * 1000;   // 65 seconds (must be > keepAliveTimeout)
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 
-const labeler = new LabelerServer(process.env.LABELER_DID || "");
+const labeler = new LabelerServer(LABELER_DID);
 
 app.get("/", (req, res) => {
   res.send("Bluesky Labeler Running");
@@ -35,7 +49,7 @@ app.get("/", (req, res) => {
 server.on("upgrade", (req, socket, head) => labeler.handleUpgrade(req, socket, head));
 
 server.listen(PORT, "0.0.0.0", async () => {
-  await labeler.loadKey(process.env.LABELER_PRIVATE_KEY || "");
+  await labeler.loadKey(LABELER_PRIVATE_KEY);
   console.log(`Server running on port ${PORT}`);
   startJetstream(labeler);
 });

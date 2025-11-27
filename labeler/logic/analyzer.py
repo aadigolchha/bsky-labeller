@@ -1,21 +1,41 @@
 """
-Production-grade Bluesky Misinformation Analyzer
-Uses Community Notes data for real-time misinformation detection via embeddings and clustering.
-Designed to work with the TypeScript labeler infrastructure.
+Production-Grade Bluesky Misinformation Labeler
+================================================
+
+Uses Community Notes data to identify and label misinformation on Bluesky.
+Dynamically generates labels based on identified misinformation clusters.
+
+This analyzer:
+1. Loads Community Notes TSV data
+2. Generates embeddings and clusters similar misinformation themes
+3. Creates dynamic label definitions that can be registered with Bluesky
+4. Analyzes incoming posts for similarity to known misinformation patterns
+5. Uses LLM-based stance detection to avoid labeling counter-speech
+
+Integration:
+- Runs as a FastAPI server on Unix Domain Socket
+- Called by Node.js jetstream.ts for each incoming post
+- Returns {label: string | null, score?: float, ...} format
+
+
 """
 
 import os
+import re
 import json
 import hashlib
 import logging
 import pickle
 import csv
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
 from contextlib import asynccontextmanager
+
+import time
+import threading
 
 import numpy as np
 from sklearn.cluster import DBSCAN
@@ -25,7 +45,10 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
 
-# Configure logging
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -36,18 +59,48 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================================
 
-CONFIG = {
-    'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY'),
-    'EMBEDDING_MODEL': 'text-embedding-3-small',
-    'EMBEDDING_BATCH_SIZE': 100,
-    'CLUSTERING_EPS': 0.3,
-    'CLUSTERING_MIN_SAMPLES': 2,
-    'CONFIDENCE_THRESHOLD': 0.75,
-    'STANCE_DETECTION_THRESHOLD': 0.45,
-    'MAX_NOTES': int(os.getenv('MAX_NOTES', '1000')),
-    'CACHE_DIR': '/data/cache' if os.getenv('NODE_ENV') == 'production' else './cache',
-    'NOTES_FILE': os.getenv('NOTES_FILE', 'notes-00000.tsv'),
-}
+class Config:
+    """Configuration with sensible defaults, overridable via environment variables."""
+
+    # OpenAI
+    OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY', '')
+    EMBEDDING_MODEL: str = os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')
+    LLM_MODEL: str = os.getenv('LLM_MODEL', 'gpt-4o-mini')
+    EMBEDDING_BATCH_SIZE: int = int(os.getenv('EMBEDDING_BATCH_SIZE', '100'))
+
+    # Rate limiting for embeddings (requests per minute)
+    # OpenAI Tier 1: 3000 RPM, Tier 2: 5000 RPM
+    # Set conservatively to stay well under limits
+    EMBEDDING_RPM_LIMIT: int = int(os.getenv('EMBEDDING_RPM_LIMIT', '500'))
+
+    # Clustering
+    CLUSTERING_EPS: float = float(os.getenv('CLUSTERING_EPS', '0.3'))
+    CLUSTERING_MIN_SAMPLES: int = int(os.getenv('CLUSTERING_MIN_SAMPLES', '2'))
+
+    # Detection thresholds
+    SIMILARITY_THRESHOLD: float = float(os.getenv('SIMILARITY_THRESHOLD', '0.45'))
+    HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv('HIGH_CONFIDENCE_THRESHOLD', '0.70'))
+    
+    # Data paths (production uses /data volume)
+    IS_PRODUCTION: bool = os.getenv('NODE_ENV') == 'production'
+    DATA_DIR: str = '/data' if IS_PRODUCTION else './data'
+    CACHE_DIR: str = f"{DATA_DIR}/cache"
+    NOTES_FILE: str = os.getenv('NOTES_FILE', f"{DATA_DIR}/notes-00000.tsv")
+    LABELS_OUTPUT_FILE: str = f"{DATA_DIR}/generated-labels.json"
+    
+    # Limits
+    MAX_NOTES: int = int(os.getenv('MAX_NOTES', '1000'))
+    MAX_CLUSTERS: int = int(os.getenv('MAX_CLUSTERS', '50'))
+    
+    @classmethod
+    def validate(cls) -> List[str]:
+        """Validate configuration, return list of errors."""
+        errors = []
+        if not cls.OPENAI_API_KEY:
+            errors.append("OPENAI_API_KEY is required")
+        return errors
+
+CONFIG = Config()
 
 # ============================================================================
 # DATA CLASSES
@@ -55,7 +108,7 @@ CONFIG = {
 
 @dataclass
 class CommunityNote:
-    """Represents a Community Note from X/Twitter"""
+    """A Community Note from X/Twitter that identifies misinformation."""
     note_id: str
     tweet_id: str
     classification: str
@@ -68,13 +121,78 @@ class CommunityNote:
 
 @dataclass
 class MisinfoCluster:
-    """Represents a cluster of similar misinformation"""
+    """A cluster of semantically similar misinformation."""
     cluster_id: int
     notes: List[CommunityNote]
     centroid: np.ndarray
-    theme: str
+    theme: str  # Human-readable theme description
+    label_id: str  # Bluesky-compatible label identifier (lowercase, alphanumeric + hyphens)
+    label_name: str  # Display name for the label
+    label_description: str  # Full description
     keywords: List[str]
-    confidence: float
+    severity: str = "inform"  # inform, alert, or none
+    blurs: str = "none"  # content, media, or none
+
+
+@dataclass 
+class LabelDefinition:
+    """A label definition ready for Bluesky registration."""
+    identifier: str
+    severity: str
+    blurs: str
+    defaultSetting: str
+    locales: List[Dict[str, str]]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "identifier": self.identifier,
+            "severity": self.severity,
+            "blurs": self.blurs,
+            "defaultSetting": self.defaultSetting,
+            "locales": self.locales
+        }
+
+
+# ============================================================================
+# RATE LIMITER
+# ============================================================================
+
+class RateLimiter:
+    """Token bucket rate limiter for API calls."""
+
+    def __init__(self, requests_per_minute: int):
+        self.rpm = requests_per_minute
+        self.tokens = requests_per_minute
+        self.last_refill = time.monotonic()
+        self.lock = threading.Lock()
+        self.dropped = 0
+
+    def acquire(self) -> bool:
+        """Try to acquire a token. Returns True if allowed, False if rate limited."""
+        with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+
+            # Refill tokens based on elapsed time
+            tokens_to_add = elapsed * (self.rpm / 60.0)
+            self.tokens = min(self.rpm, self.tokens + tokens_to_add)
+            self.last_refill = now
+
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            else:
+                self.dropped += 1
+                return False
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get rate limiter statistics."""
+        with self.lock:
+            return {
+                "rpm_limit": self.rpm,
+                "tokens_available": int(self.tokens),
+                "dropped_requests": self.dropped
+            }
 
 
 # ============================================================================
@@ -82,98 +200,222 @@ class MisinfoCluster:
 # ============================================================================
 
 class EmbeddingService:
-    """Service for generating embeddings using OpenAI"""
-    
+    """Handles embedding generation with caching and rate limiting."""
+
     def __init__(self, api_key: str):
         self.client = openai.OpenAI(api_key=api_key)
-        self.model = CONFIG['EMBEDDING_MODEL']
-        self.cache_dir = Path(CONFIG['CACHE_DIR'])
+        self.model = CONFIG.EMBEDDING_MODEL
+        self.cache_dir = Path(CONFIG.CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.embedding_cache: Dict[str, np.ndarray] = {}
+        self.cache: Dict[str, np.ndarray] = {}
+        self.rate_limiter = RateLimiter(CONFIG.EMBEDDING_RPM_LIMIT)
         self._load_cache()
     
+    def _cache_path(self) -> Path:
+        return self.cache_dir / 'embeddings.pkl'
+    
     def _load_cache(self):
-        """Load embedding cache from disk"""
-        cache_file = self.cache_dir / 'embeddings.pkl'
-        if cache_file.exists():
+        """Load cached embeddings from disk."""
+        if self._cache_path().exists():
             try:
-                with open(cache_file, 'rb') as f:
-                    self.embedding_cache = pickle.load(f)
-                logger.info(f"Loaded {len(self.embedding_cache)} cached embeddings")
+                with open(self._cache_path(), 'rb') as f:
+                    self.cache = pickle.load(f)
+                logger.info(f"Loaded {len(self.cache)} cached embeddings")
             except Exception as e:
-                logger.error(f"Failed to load embedding cache: {e}")
+                logger.warning(f"Could not load embedding cache: {e}")
+                self.cache = {}
     
     def _save_cache(self):
-        """Save embedding cache to disk"""
-        cache_file = self.cache_dir / 'embeddings.pkl'
+        """Persist embedding cache to disk."""
         try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(self.embedding_cache, f)
+            with open(self._cache_path(), 'wb') as f:
+                pickle.dump(self.cache, f)
         except Exception as e:
             logger.error(f"Failed to save embedding cache: {e}")
     
-    def get_embedding(self, text: str) -> Optional[np.ndarray]:
-        """Get embedding for a single text"""
-        text_hash = hashlib.md5(text.encode()).hexdigest()
-        if text_hash in self.embedding_cache:
-            return self.embedding_cache[text_hash]
-        
+    def _text_hash(self, text: str) -> str:
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]
+    
+    def get_embedding(self, text: str, respect_rate_limit: bool = True) -> Optional[np.ndarray]:
+        """Get embedding for a single text, using cache if available.
+
+        Args:
+            text: The text to embed
+            respect_rate_limit: If True, returns None when rate limited (for real-time posts).
+                               If False, always makes the API call (for initialization).
+        """
+        text_hash = self._text_hash(text)
+
+        if text_hash in self.cache:
+            return self.cache[text_hash]
+
+        # Check rate limit for real-time requests
+        if respect_rate_limit and not self.rate_limiter.acquire():
+            return None
+
         try:
             response = self.client.embeddings.create(
                 input=text,
                 model=self.model
             )
             embedding = np.array(response.data[0].embedding)
-            self.embedding_cache[text_hash] = embedding
-            self._save_cache()
+            self.cache[text_hash] = embedding
+            # Lazy cache save - every 100 new embeddings
+            if len(self.cache) % 100 == 0:
+                self._save_cache()
             return embedding
         except Exception as e:
-            logger.error(f"Failed to get embedding: {e}")
+            logger.error(f"Embedding API error: {e}")
             return None
     
     def get_embeddings_batch(self, texts: List[str]) -> List[Optional[np.ndarray]]:
-        """Get embeddings for multiple texts in batches"""
-        embeddings = []
-        batch_size = CONFIG['EMBEDDING_BATCH_SIZE']
+        """Get embeddings for multiple texts efficiently."""
+        results: List[Optional[np.ndarray]] = [None] * len(texts)
+        uncached_indices: List[int] = []
+        uncached_texts: List[str] = []
         
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            batch_embeddings: List[Optional[np.ndarray]] = []
-            uncached_texts = []
-            uncached_indices = []
-            
-            # Check cache first
-            for j, text in enumerate(batch):
-                text_hash = hashlib.md5(text.encode()).hexdigest()
-                if text_hash in self.embedding_cache:
-                    batch_embeddings.append(self.embedding_cache[text_hash])
-                else:
-                    uncached_texts.append(text)
-                    uncached_indices.append(j)
-                    batch_embeddings.append(None)
-            
-            # Get embeddings for uncached texts
-            if uncached_texts:
+        # Check cache first
+        for i, text in enumerate(texts):
+            text_hash = self._text_hash(text)
+            if text_hash in self.cache:
+                results[i] = self.cache[text_hash]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(text)
+        
+        # Batch API calls for uncached texts
+        if uncached_texts:
+            batch_size = CONFIG.EMBEDDING_BATCH_SIZE
+            for batch_start in range(0, len(uncached_texts), batch_size):
+                batch_end = min(batch_start + batch_size, len(uncached_texts))
+                batch = uncached_texts[batch_start:batch_end]
+                batch_indices = uncached_indices[batch_start:batch_end]
+                
                 try:
                     response = self.client.embeddings.create(
-                        input=uncached_texts,
+                        input=batch,
                         model=self.model
                     )
                     
-                    for idx, embedding_data in zip(uncached_indices, response.data):
-                        embedding = np.array(embedding_data.embedding)
-                        batch_embeddings[idx] = embedding
-                        text_hash = hashlib.md5(batch[idx].encode()).hexdigest()
-                        self.embedding_cache[text_hash] = embedding
+                    for j, emb_data in enumerate(response.data):
+                        embedding = np.array(emb_data.embedding)
+                        original_idx = batch_indices[j]
+                        results[original_idx] = embedding
+                        
+                        # Cache it
+                        text_hash = self._text_hash(texts[original_idx])
+                        self.cache[text_hash] = embedding
                     
-                    self._save_cache()
+                    logger.info(f"Embedded batch {batch_start//batch_size + 1}: {len(batch)} texts")
+                    
                 except Exception as e:
-                    logger.error(f"Failed to get batch embeddings: {e}")
+                    logger.error(f"Batch embedding error: {e}")
             
-            embeddings.extend(batch_embeddings)
-            logger.info(f"Processed batch {i//batch_size + 1}, total embeddings: {len(embeddings)}")
+            self._save_cache()
         
-        return embeddings
+        return results
+
+
+# ============================================================================
+# LABEL GENERATOR
+# ============================================================================
+
+class LabelGenerator:
+    """Generates Bluesky label definitions from misinformation clusters."""
+    
+    def __init__(self, openai_client: openai.OpenAI):
+        self.client = openai_client
+    
+    def sanitize_label_id(self, text: str) -> str:
+        """Convert text to valid Bluesky label identifier."""
+        # Lowercase, replace spaces with hyphens, remove non-alphanumeric
+        sanitized = text.lower().strip()
+        sanitized = re.sub(r'[^a-z0-9\s-]', '', sanitized)
+        sanitized = re.sub(r'\s+', '-', sanitized)
+        sanitized = re.sub(r'-+', '-', sanitized)
+        sanitized = sanitized.strip('-')
+        # Limit length
+        return sanitized[:50] if sanitized else 'unknown'
+    
+    def generate_label_for_cluster(
+        self, 
+        cluster_id: int, 
+        notes: List[CommunityNote]
+    ) -> Tuple[str, str, str, str, List[str]]:
+        """
+        Use LLM to generate a meaningful label for a cluster of misinformation.
+        
+        Returns: (label_id, label_name, description, severity, keywords)
+        """
+        # Sample notes for analysis
+        sample_summaries = [n.summary for n in notes[:5]]
+        summaries_text = "\n".join(f"- {s}" for s in sample_summaries)
+        
+        prompt = f"""Analyze these Community Notes that fact-check similar misinformation:
+
+{summaries_text}
+
+Based on these notes, create a label for this type of misinformation. Respond with JSON:
+{{
+    "label_id": "short-hyphenated-id (max 30 chars, lowercase, e.g., 'covid-vaccine-myths')",
+    "label_name": "Human-readable name (max 50 chars, e.g., 'COVID Vaccine Misinformation')",
+    "description": "Clear description of this misinformation type (max 200 chars)",
+    "severity": "inform or alert (use 'alert' only for dangerous health/safety misinformation)",
+    "keywords": ["list", "of", "5-10", "relevant", "keywords"]
+}}
+
+Important:
+- label_id must be lowercase, alphanumeric with hyphens only
+- Be specific about what type of misinformation this is
+- Keywords should help identify similar posts"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=CONFIG.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert at analyzing misinformation patterns. Generate clear, accurate labels for fact-checking purposes."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            label_id = self.sanitize_label_id(result.get('label_id', f'misinfo-{cluster_id}'))
+            label_name = result.get('label_name', f'Misinformation Type {cluster_id}')[:50]
+            description = result.get('description', 'Potential misinformation identified by Community Notes.')[:200]
+            severity = result.get('severity', 'inform')
+            if severity not in ['inform', 'alert', 'none']:
+                severity = 'inform'
+            keywords = result.get('keywords', [])[:10]
+            
+            return label_id, label_name, description, severity, keywords
+            
+        except Exception as e:
+            logger.error(f"Label generation failed for cluster {cluster_id}: {e}")
+            # Fallback
+            return (
+                f"misinfo-{cluster_id}",
+                f"Misinformation Pattern {cluster_id}",
+                "Content flagged by Community Notes analysis.",
+                "inform",
+                []
+            )
+    
+    def create_label_definition(self, cluster: MisinfoCluster) -> LabelDefinition:
+        """Create a Bluesky-compatible label definition from a cluster."""
+        return LabelDefinition(
+            identifier=cluster.label_id,
+            severity=cluster.severity,
+            blurs=cluster.blurs,
+            defaultSetting="warn",
+            locales=[{
+                "lang": "en",
+                "name": cluster.label_name,
+                "description": cluster.label_description
+            }]
+        )
 
 
 # ============================================================================
@@ -181,195 +423,273 @@ class EmbeddingService:
 # ============================================================================
 
 class MisinformationAnalyzer:
-    """Analyzes content for misinformation using Community Notes data"""
+    """Main analyzer that processes Community Notes and analyzes posts."""
     
-    def __init__(self, embedding_service: EmbeddingService):
+    def __init__(self, embedding_service: EmbeddingService, openai_client: openai.OpenAI):
         self.embedding_service = embedding_service
+        self.openai_client = openai_client
+        self.label_generator = LabelGenerator(openai_client)
         self.clusters: List[MisinfoCluster] = []
-        self.keyword_filter: set = set()
-        self.openai_client = openai.OpenAI(api_key=CONFIG['OPENAI_API_KEY'])
+        self.label_definitions: List[LabelDefinition] = []
+        self.keyword_index: Dict[str, List[int]] = {}  # keyword -> cluster_ids
     
-    def load_community_notes(self, tsv_path: str, max_notes: Optional[int] = None) -> List[CommunityNote]:
-        """Load Community Notes from TSV file"""
+    def load_community_notes(self, tsv_path: str) -> List[CommunityNote]:
+        """Load and filter Community Notes from TSV file."""
         notes = []
+        path = Path(tsv_path)
         
-        if not Path(tsv_path).exists():
+        if not path.exists():
             logger.warning(f"Community Notes file not found: {tsv_path}")
             return notes
         
-        with open(tsv_path, 'r', encoding='utf-8') as f:
+        logger.info(f"Loading Community Notes from {tsv_path}")
+        
+        with open(path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f, delimiter='\t')
             
             for i, row in enumerate(reader):
-                if max_notes and i >= max_notes:
+                if CONFIG.MAX_NOTES and i >= CONFIG.MAX_NOTES:
                     break
                 
-                # Filter for misleading notes with summaries
-                if (row.get('classification') == 'MISINFORMED_OR_POTENTIALLY_MISLEADING' and
-                    row.get('summary') and len(row.get('summary', '')) > 10):
-                    
-                    # Determine misleading type
-                    misleading_types = []
-                    if row.get('misleadingFactualError') == '1':
-                        misleading_types.append('factual_error')
-                    if row.get('misleadingManipulatedMedia') == '1':
-                        misleading_types.append('manipulated_media')
-                    if row.get('misleadingMissingImportantContext') == '1':
-                        misleading_types.append('missing_context')
-                    if row.get('misleadingUnverifiedClaimAsFact') == '1':
-                        misleading_types.append('unverified_claim')
-                    
-                    try:
-                        created_at = datetime.fromtimestamp(int(row['createdAtMillis']) / 1000)
-                    except (ValueError, KeyError):
-                        created_at = datetime.now()
-                    
-                    note = CommunityNote(
-                        note_id=row.get('noteId', ''),
-                        tweet_id=row.get('tweetId', ''),
-                        classification=row.get('classification', ''),
-                        summary=row.get('summary', ''),
-                        misleading_type=','.join(misleading_types) if misleading_types else 'other',
-                        created_at=created_at
-                    )
-                    notes.append(note)
+                # Only include notes that identify misinformation
+                classification = row.get('classification', '')
+                summary = row.get('summary', '')
+                
+                if classification != 'MISINFORMED_OR_POTENTIALLY_MISLEADING':
+                    continue
+                if not summary or len(summary) < 20:
+                    continue
+                
+                # Categorize the type of misinformation
+                misleading_types = []
+                for field, label in [
+                    ('misleadingFactualError', 'factual_error'),
+                    ('misleadingManipulatedMedia', 'manipulated_media'),
+                    ('misleadingMissingImportantContext', 'missing_context'),
+                    ('misleadingUnverifiedClaimAsFact', 'unverified_claim'),
+                    ('misleadingSatire', 'satire'),
+                    ('misleadingOutdatedInformation', 'outdated'),
+                ]:
+                    if row.get(field) == '1':
+                        misleading_types.append(label)
+                
+                try:
+                    created_at = datetime.fromtimestamp(int(row.get('createdAtMillis', 0)) / 1000)
+                except (ValueError, TypeError):
+                    created_at = datetime.now()
+                
+                note = CommunityNote(
+                    note_id=row.get('noteId', str(i)),
+                    tweet_id=row.get('tweetId', ''),
+                    classification=classification,
+                    summary=summary,
+                    misleading_type=','.join(misleading_types) if misleading_types else 'general',
+                    created_at=created_at
+                )
+                notes.append(note)
         
-        logger.info(f"Loaded {len(notes)} Community Notes")
+        logger.info(f"Loaded {len(notes)} valid Community Notes")
         return notes
     
     def generate_embeddings(self, notes: List[CommunityNote]):
-        """Generate embeddings for Community Notes"""
+        """Generate embeddings for all notes."""
+        logger.info(f"Generating embeddings for {len(notes)} notes...")
+        
         texts = [note.summary for note in notes]
         embeddings = self.embedding_service.get_embeddings_batch(texts)
         
         for note, embedding in zip(notes, embeddings):
-            if embedding is not None:
-                note.embedding = embedding
+            note.embedding = embedding
         
-        valid_count = sum(1 for n in notes if n.embedding is not None)
-        logger.info(f"Generated embeddings for {valid_count}/{len(notes)} notes")
+        valid = sum(1 for n in notes if n.embedding is not None)
+        logger.info(f"Successfully embedded {valid}/{len(notes)} notes")
     
     def cluster_notes(self, notes: List[CommunityNote]) -> List[MisinfoCluster]:
-        """Cluster similar Community Notes using DBSCAN"""
+        """Cluster notes using DBSCAN and generate labels for each cluster."""
         notes_with_embeddings = [n for n in notes if n.embedding is not None]
         
-        if not notes_with_embeddings:
-            logger.warning("No notes with embeddings to cluster")
+        if len(notes_with_embeddings) < CONFIG.CLUSTERING_MIN_SAMPLES:
+            logger.warning(f"Not enough notes for clustering: {len(notes_with_embeddings)}")
             return []
         
-        X = np.array([n.embedding for n in notes_with_embeddings])
+        logger.info(f"Clustering {len(notes_with_embeddings)} notes...")
         
+        # Build embedding matrix
+        X = np.vstack([n.embedding for n in notes_with_embeddings])
+        
+        # DBSCAN clustering with cosine distance
         clustering = DBSCAN(
-            eps=CONFIG['CLUSTERING_EPS'],
-            min_samples=CONFIG['CLUSTERING_MIN_SAMPLES'],
+            eps=CONFIG.CLUSTERING_EPS,
+            min_samples=CONFIG.CLUSTERING_MIN_SAMPLES,
             metric='cosine'
         ).fit(X)
         
-        clusters_dict = defaultdict(list)
+        # Group notes by cluster
+        cluster_notes: Dict[int, List[CommunityNote]] = defaultdict(list)
         for note, label in zip(notes_with_embeddings, clustering.labels_):
-            if label != -1:  # Ignore noise
+            if label >= 0:  # -1 is noise
                 note.cluster_id = label
-                clusters_dict[label].append(note)
+                cluster_notes[label].append(note)
         
-        misinfo_clusters = []
-        for cluster_id, cluster_notes in clusters_dict.items():
-            embeddings = np.array([n.embedding for n in cluster_notes])
+        logger.info(f"Found {len(cluster_notes)} clusters (+ {sum(1 for l in clustering.labels_ if l == -1)} noise points)")
+        
+        # Build MisinfoCluster objects with generated labels
+        clusters = []
+        for cluster_id, notes_in_cluster in sorted(cluster_notes.items())[:CONFIG.MAX_CLUSTERS]:
+            # Compute centroid
+            embeddings = np.vstack([n.embedding for n in notes_in_cluster])
             centroid = np.mean(embeddings, axis=0)
             
-            # Extract theme and keywords
-            theme, keywords = self._extract_cluster_theme(cluster_notes)
+            # Generate label using LLM
+            label_id, label_name, description, severity, keywords = \
+                self.label_generator.generate_label_for_cluster(cluster_id, notes_in_cluster)
             
             cluster = MisinfoCluster(
-                cluster_id=int(cluster_id),
-                notes=cluster_notes,
+                cluster_id=cluster_id,
+                notes=notes_in_cluster,
                 centroid=centroid,
-                theme=theme,
+                theme=label_name,
+                label_id=label_id,
+                label_name=label_name,
+                label_description=description,
                 keywords=keywords,
-                confidence=0.9
+                severity=severity,
+                blurs="none"
             )
-            misinfo_clusters.append(cluster)
-        
-        logger.info(f"Created {len(misinfo_clusters)} misinformation clusters")
-        self.clusters = misinfo_clusters
-        return misinfo_clusters
-    
-    def _extract_cluster_theme(self, notes: List[CommunityNote]) -> Tuple[str, List[str]]:
-        """Extract theme and keywords from a cluster using GPT"""
-        sample_notes = notes[:5]
-        summaries = '\n'.join([f"- {n.summary}" for n in sample_notes])
-        
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert at analyzing misinformation patterns. Extract the common theme and keywords from these Community Notes summaries."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Analyze these Community Notes summaries and provide:
-1. A brief theme description (max 100 characters)
-2. 5-10 relevant keywords
-
-Summaries:
-{summaries}
-
-Respond in JSON format:
-{{"theme": "...", "keywords": ["...", "..."]}}"""
-                    }
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"}
-            )
+            clusters.append(cluster)
             
-            result = json.loads(response.choices[0].message.content)
-            return result.get('theme', 'Unknown theme'), result.get('keywords', [])
-        except Exception as e:
-            logger.error(f"Failed to extract cluster theme: {e}")
-            return "Unknown theme", []
+            logger.info(f"Cluster {cluster_id}: '{label_name}' ({len(notes_in_cluster)} notes, {len(keywords)} keywords)")
+        
+        self.clusters = clusters
+        self._build_keyword_index()
+        self._generate_label_definitions()
+        
+        return clusters
     
-    def build_keyword_filter(self):
-        """Build keyword filter from cluster keywords for pre-filtering"""
-        self.keyword_filter = set()
+    def _build_keyword_index(self):
+        """Build an inverted index from keywords to cluster IDs for fast filtering."""
+        self.keyword_index = defaultdict(list)
         for cluster in self.clusters:
             for keyword in cluster.keywords:
-                self.keyword_filter.add(keyword.lower())
-        logger.info(f"Built keyword filter with {len(self.keyword_filter)} keywords")
+                kw_lower = keyword.lower()
+                if cluster.cluster_id not in self.keyword_index[kw_lower]:
+                    self.keyword_index[kw_lower].append(cluster.cluster_id)
+        
+        logger.info(f"Built keyword index with {len(self.keyword_index)} unique keywords")
     
-    def should_analyze_post(self, text: str) -> bool:
-        """Quick keyword-based check to filter out irrelevant posts"""
-        if not text or not self.keyword_filter:
-            return True
+    def _generate_label_definitions(self):
+        """Generate Bluesky label definitions and save to file."""
+        self.label_definitions = [
+            self.label_generator.create_label_definition(c) for c in self.clusters
+        ]
+        
+        # Save to JSON for use by publish-labels.ts
+        output = {
+            "labelValues": [d.identifier for d in self.label_definitions],
+            "labelValueDefinitions": [d.to_dict() for d in self.label_definitions],
+            "clusters": [
+                {
+                    "cluster_id": c.cluster_id,
+                    "label_id": c.label_id,
+                    "theme": c.theme,
+                    "keywords": c.keywords,
+                    "note_count": len(c.notes)
+                }
+                for c in self.clusters
+            ],
+            "generated_at": datetime.now().isoformat()
+        }
+        
+        output_path = Path(CONFIG.LABELS_OUTPUT_FILE)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w') as f:
+            json.dump(output, f, indent=2)
+        
+        logger.info(f"Saved {len(self.label_definitions)} label definitions to {output_path}")
+    
+    def get_candidate_clusters(self, text: str) -> List[MisinfoCluster]:
+        """Use keyword index for fast pre-filtering of potentially relevant clusters."""
+        if not self.keyword_index:
+            return self.clusters  # No index, check all
         
         text_lower = text.lower()
-        for keyword in self.keyword_filter:
+        candidate_ids = set()
+        
+        for keyword, cluster_ids in self.keyword_index.items():
             if keyword in text_lower:
-                return True
-        return False
+                candidate_ids.update(cluster_ids)
+        
+        if not candidate_ids:
+            return []  # No keyword matches
+        
+        return [c for c in self.clusters if c.cluster_id in candidate_ids]
     
-    def analyze_post(self, text: str, did: str) -> Optional[Tuple[str, float, int]]:
+    def detect_stance(self, text: str, cluster: MisinfoCluster) -> str:
+        """
+        Determine if the text supports, refutes, or neutrally discusses the misinformation.
+        
+        This is critical to avoid labeling counter-speech and fact-checks.
+        """
+        prompt = f"""Analyze the stance of this social media post towards a known misinformation theme.
+
+Misinformation theme: {cluster.theme}
+Description: {cluster.label_description}
+
+Post text:
+"{text}"
+
+Does this post:
+1. SUPPORT the misinformation (spreading it, agreeing with it)
+2. REFUTE the misinformation (fact-checking, correcting, debunking)
+3. NEUTRAL (just discussing the topic without taking a clear stance)
+
+Respond with exactly one word: supports, refutes, or neutral"""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=CONFIG.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert at stance detection for misinformation analysis. Be conservative - only return 'supports' if the post is clearly spreading misinformation."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=10
+            )
+            
+            stance = response.choices[0].message.content.strip().lower()
+            if stance in ['supports', 'refutes', 'neutral']:
+                return stance
+            return 'neutral'
+            
+        except Exception as e:
+            logger.error(f"Stance detection failed: {e}")
+            return 'neutral'  # Safe default
+    
+    def analyze_post(self, text: str, author_did: str) -> Optional[Dict[str, Any]]:
         """
         Analyze a post for misinformation.
-        Returns: (label, confidence, cluster_id) or None
+        
+        Returns a dict with label info if misinformation is detected, None otherwise.
         """
         if not text or not self.clusters:
             return None
         
-        # Quick keyword filter
-        if not self.should_analyze_post(text):
+        # Fast keyword pre-filter
+        candidates = self.get_candidate_clusters(text)
+        if not candidates:
             return None
         
-        # Generate embedding
+        # Generate embedding for the post
         post_embedding = self.embedding_service.get_embedding(text)
         if post_embedding is None:
             return None
         
-        # Compare with cluster centroids
-        best_match = None
+        # Find best matching cluster
+        best_cluster = None
         best_similarity = 0.0
         
-        for cluster in self.clusters:
+        for cluster in candidates:
             similarity = cosine_similarity(
                 post_embedding.reshape(1, -1),
                 cluster.centroid.reshape(1, -1)
@@ -377,116 +697,109 @@ Respond in JSON format:
             
             if similarity > best_similarity:
                 best_similarity = similarity
-                best_match = cluster
+                best_cluster = cluster
         
-        if best_similarity < CONFIG['STANCE_DETECTION_THRESHOLD']:
+        # Check if similarity exceeds threshold
+        if best_similarity < CONFIG.SIMILARITY_THRESHOLD:
             return None
         
-        # Stance detection
-        stance = self._detect_stance(text, best_match)
+        # Stance detection - only label if post supports the misinformation
+        stance = self.detect_stance(text, best_cluster)
         
-        if stance == 'supports':
-            if best_similarity >= CONFIG['CONFIDENCE_THRESHOLD']:
-                return 'misinformation', best_similarity, best_match.cluster_id
-            else:
-                return 'potential-misinformation', best_similarity, best_match.cluster_id
+        if stance != 'supports':
+            logger.debug(f"Post matched cluster '{best_cluster.label_id}' but stance is '{stance}', not labeling")
+            return None
         
-        return None
-    
-    def _detect_stance(self, text: str, cluster: MisinfoCluster) -> str:
-        """Detect stance of text towards misinformation"""
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert at stance detection. Determine if the given text supports, refutes, or is neutral towards a claim."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Misinformation theme: {cluster.theme}
-Keywords: {', '.join(cluster.keywords)}
-
-Text to analyze:
-"{text}"
-
-Does this text support, refute, or discuss neutrally the misinformation?
-Respond with only one word: "supports", "refutes", or "neutral"."""
-                    }
-                ],
-                temperature=0.1,
-                max_tokens=10
-            )
-            
-            stance = response.choices[0].message.content.strip().lower()
-            if stance not in ['supports', 'refutes', 'neutral']:
-                return 'neutral'
-            return stance
-        except Exception as e:
-            logger.error(f"Stance detection failed: {e}")
-            return 'neutral'
+        # Determine confidence level
+        is_high_confidence = best_similarity >= CONFIG.HIGH_CONFIDENCE_THRESHOLD
+        
+        return {
+            "label": best_cluster.label_id,
+            "score": float(best_similarity),
+            "cluster_id": best_cluster.cluster_id,
+            "theme": best_cluster.theme,
+            "severity": best_cluster.severity,
+            "high_confidence": is_high_confidence,
+            "text": text[:200]  # Truncate for logging
+        }
 
 
 # ============================================================================
-# GLOBAL STATE & INITIALIZATION
+# GLOBAL STATE
 # ============================================================================
 
 class AnalyzerState:
-    """Global state for the analyzer"""
+    """Global application state."""
     analyzer: Optional[MisinformationAnalyzer] = None
     initialized: bool = False
     init_error: Optional[str] = None
+    label_count: int = 0
 
 state = AnalyzerState()
 
 
-def initialize_analyzer():
-    """Initialize the misinformation analyzer with Community Notes data"""
-    logger.info("Initializing Misinformation Analyzer...")
+def initialize():
+    """Initialize the analyzer with Community Notes data."""
+    logger.info("=" * 60)
+    logger.info("INITIALIZING MISINFORMATION ANALYZER")
+    logger.info("=" * 60)
     
-    if not CONFIG['OPENAI_API_KEY']:
-        state.init_error = "OPENAI_API_KEY not configured"
-        logger.error(state.init_error)
+    # Validate config
+    errors = CONFIG.validate()
+    if errors:
+        state.init_error = "; ".join(errors)
+        logger.error(f"Configuration errors: {state.init_error}")
         return False
     
     try:
-        # Initialize services
-        embedding_service = EmbeddingService(CONFIG['OPENAI_API_KEY'])
-        analyzer = MisinformationAnalyzer(embedding_service)
+        # Initialize OpenAI client
+        openai_client = openai.OpenAI(api_key=CONFIG.OPENAI_API_KEY)
+        
+        # Initialize embedding service
+        embedding_service = EmbeddingService(CONFIG.OPENAI_API_KEY)
+        
+        # Initialize analyzer
+        analyzer = MisinformationAnalyzer(embedding_service, openai_client)
         
         # Load Community Notes
-        notes_file = CONFIG['NOTES_FILE']
-        notes = analyzer.load_community_notes(notes_file, CONFIG['MAX_NOTES'])
+        notes = analyzer.load_community_notes(CONFIG.NOTES_FILE)
         
         if notes:
             # Generate embeddings
-            logger.info("Generating embeddings for Community Notes...")
             analyzer.generate_embeddings(notes)
             
-            # Cluster notes
-            logger.info("Clustering notes to identify misinformation themes...")
+            # Cluster and generate labels
             clusters = analyzer.cluster_notes(notes)
             
             if clusters:
-                analyzer.build_keyword_filter()
+                state.label_count = len(clusters)
+                logger.info(f"Generated {len(clusters)} dynamic labels")
                 
-                # Log cluster info
-                for cluster in clusters[:5]:
-                    logger.info(f"Cluster: {cluster.theme}")
-                    logger.info(f"  Keywords: {', '.join(cluster.keywords[:5])}")
-                    logger.info(f"  Notes: {len(cluster.notes)}")
+                # Log label summary
+                logger.info("-" * 40)
+                logger.info("REGISTERED LABELS:")
+                for c in clusters[:10]:
+                    logger.info(f"  - {c.label_id}: {c.label_name}")
+                if len(clusters) > 10:
+                    logger.info(f"  ... and {len(clusters) - 10} more")
+                logger.info("-" * 40)
+            else:
+                logger.warning("No clusters created from Community Notes")
         else:
-            logger.warning("No Community Notes loaded - running in fallback mode")
+            logger.warning("No Community Notes loaded - analyzer will return no labels")
         
         state.analyzer = analyzer
         state.initialized = True
-        logger.info("Misinformation Analyzer initialized successfully!")
+        
+        logger.info("=" * 60)
+        logger.info("ANALYZER INITIALIZATION COMPLETE")
+        logger.info("=" * 60)
+        
         return True
         
     except Exception as e:
         state.init_error = str(e)
-        logger.error(f"Failed to initialize analyzer: {e}")
+        logger.exception(f"Initialization failed: {e}")
         return False
 
 
@@ -496,91 +809,113 @@ def initialize_analyzer():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan - initialize on startup"""
-    initialize_analyzer()
+    """Application lifecycle manager."""
+    initialize()
     yield
     logger.info("Shutting down analyzer...")
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Bluesky Misinformation Analyzer",
+    description="Analyzes posts for misinformation using Community Notes data",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 
 class PostPayload(BaseModel):
+    """Request payload for post analysis."""
     text: str
-    did: str
+    did: str  # Author DID
 
 
 @app.post("/analyze")
 async def analyze(payload: PostPayload):
-    """Analyze a post for misinformation"""
+    """
+    Analyze a post for misinformation.
     
-    # Fallback to simple keyword matching if not initialized
+    Returns:
+        - {label: null} if no misinformation detected
+        - {label: "label-id", score: 0.XX, ...} if misinformation detected
+    """
     if not state.initialized or state.analyzer is None:
-        text_lower = payload.text.lower()
-        
-        # Fallback keyword matching
-        if "election news" in text_lower:
-            return {"label": "election", "score": 1.0, "text": text_lower}
-        if "vaccination" in text_lower or "vaccine" in text_lower:
-            return {"label": "vaccine", "score": 1.0, "text": text_lower}
-        
+        # Not initialized - return no label (don't fail the request)
+        return {"label": None, "error": state.init_error or "Not initialized"}
+    
+    if not payload.text:
         return {"label": None}
     
-    # Use sophisticated analysis
     result = state.analyzer.analyze_post(payload.text, payload.did)
     
     if result:
-        label, confidence, cluster_id = result
-        
-        # Get theme for logging
-        theme = None
-        for cluster in state.analyzer.clusters:
-            if cluster.cluster_id == cluster_id:
-                theme = cluster.theme
-                break
-        
-        return {
-            "label": label,
-            "score": confidence,
-            "cluster_id": cluster_id,
-            "theme": theme,
-            "text": payload.text
-        }
+        return result
     
     return {"label": None}
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
+    """Health check endpoint."""
+    rate_limit_stats = None
+    if state.analyzer and state.analyzer.embedding_service:
+        rate_limit_stats = state.analyzer.embedding_service.rate_limiter.get_stats()
+
     return {
-        "status": "healthy",
+        "status": "healthy" if state.initialized else "initializing",
         "initialized": state.initialized,
+        "error": state.init_error,
         "clusters": len(state.analyzer.clusters) if state.analyzer else 0,
-        "keywords": len(state.analyzer.keyword_filter) if state.analyzer else 0,
-        "error": state.init_error
+        "labels": state.label_count,
+        "rate_limiter": rate_limit_stats
     }
 
 
 @app.get("/stats")
 async def stats():
-    """Get analyzer statistics"""
+    """Get analyzer statistics."""
     if not state.analyzer:
         return {"error": "Not initialized"}
     
     return {
         "clusters": len(state.analyzer.clusters),
-        "keywords": len(state.analyzer.keyword_filter),
-        "themes": [
+        "keywords": len(state.analyzer.keyword_index),
+        "labels": [
             {
-                "id": c.cluster_id,
-                "theme": c.theme,
+                "id": c.label_id,
+                "name": c.label_name,
+                "description": c.label_description,
+                "severity": c.severity,
                 "keywords": c.keywords[:5],
-                "notes": len(c.notes)
+                "note_count": len(c.notes)
             }
-            for c in state.analyzer.clusters[:10]
+            for c in state.analyzer.clusters
         ]
     }
 
 
+@app.get("/labels")
+async def get_labels():
+    """
+    Get the generated label definitions.
+    
+    This can be used to update publish-labels.ts with the dynamically generated labels.
+    """
+    if not state.analyzer:
+        return {"error": "Not initialized"}
+    
+    return {
+        "labelValues": [d.identifier for d in state.analyzer.label_definitions],
+        "labelValueDefinitions": [d.to_dict() for d in state.analyzer.label_definitions]
+    }
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5001)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=5001,
+        log_level="info"
+    )
