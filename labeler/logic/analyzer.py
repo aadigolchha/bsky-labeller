@@ -17,7 +17,6 @@ Integration:
 - Called by Node.js jetstream.ts for each incoming post
 - Returns {label: string | null, score?: float, ...} format
 
-
 """
 
 import os
@@ -33,9 +32,6 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
 from contextlib import asynccontextmanager
-
-import time
-import threading
 
 import numpy as np
 from sklearn.cluster import DBSCAN
@@ -61,22 +57,17 @@ logger = logging.getLogger(__name__)
 
 class Config:
     """Configuration with sensible defaults, overridable via environment variables."""
-
+    
     # OpenAI
     OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY', '')
     EMBEDDING_MODEL: str = os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')
     LLM_MODEL: str = os.getenv('LLM_MODEL', 'gpt-4o-mini')
     EMBEDDING_BATCH_SIZE: int = int(os.getenv('EMBEDDING_BATCH_SIZE', '100'))
-
-    # Rate limiting for embeddings (requests per minute)
-    # OpenAI Tier 1: 3000 RPM, Tier 2: 5000 RPM
-    # Set conservatively to stay well under limits
-    EMBEDDING_RPM_LIMIT: int = int(os.getenv('EMBEDDING_RPM_LIMIT', '500'))
-
+    
     # Clustering
     CLUSTERING_EPS: float = float(os.getenv('CLUSTERING_EPS', '0.3'))
     CLUSTERING_MIN_SAMPLES: int = int(os.getenv('CLUSTERING_MIN_SAMPLES', '2'))
-
+    
     # Detection thresholds
     SIMILARITY_THRESHOLD: float = float(os.getenv('SIMILARITY_THRESHOLD', '0.45'))
     HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv('HIGH_CONFIDENCE_THRESHOLD', '0.70'))
@@ -154,61 +145,18 @@ class LabelDefinition:
 
 
 # ============================================================================
-# RATE LIMITER
-# ============================================================================
-
-class RateLimiter:
-    """Token bucket rate limiter for API calls."""
-
-    def __init__(self, requests_per_minute: int):
-        self.rpm = requests_per_minute
-        self.tokens = requests_per_minute
-        self.last_refill = time.monotonic()
-        self.lock = threading.Lock()
-        self.dropped = 0
-
-    def acquire(self) -> bool:
-        """Try to acquire a token. Returns True if allowed, False if rate limited."""
-        with self.lock:
-            now = time.monotonic()
-            elapsed = now - self.last_refill
-
-            # Refill tokens based on elapsed time
-            tokens_to_add = elapsed * (self.rpm / 60.0)
-            self.tokens = min(self.rpm, self.tokens + tokens_to_add)
-            self.last_refill = now
-
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True
-            else:
-                self.dropped += 1
-                return False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get rate limiter statistics."""
-        with self.lock:
-            return {
-                "rpm_limit": self.rpm,
-                "tokens_available": int(self.tokens),
-                "dropped_requests": self.dropped
-            }
-
-
-# ============================================================================
 # EMBEDDING SERVICE
 # ============================================================================
 
 class EmbeddingService:
-    """Handles embedding generation with caching and rate limiting."""
-
+    """Handles embedding generation with caching."""
+    
     def __init__(self, api_key: str):
         self.client = openai.OpenAI(api_key=api_key)
         self.model = CONFIG.EMBEDDING_MODEL
         self.cache_dir = Path(CONFIG.CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache: Dict[str, np.ndarray] = {}
-        self.rate_limiter = RateLimiter(CONFIG.EMBEDDING_RPM_LIMIT)
         self._load_cache()
     
     def _cache_path(self) -> Path:
@@ -236,23 +184,13 @@ class EmbeddingService:
     def _text_hash(self, text: str) -> str:
         return hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]
     
-    def get_embedding(self, text: str, respect_rate_limit: bool = True) -> Optional[np.ndarray]:
-        """Get embedding for a single text, using cache if available.
-
-        Args:
-            text: The text to embed
-            respect_rate_limit: If True, returns None when rate limited (for real-time posts).
-                               If False, always makes the API call (for initialization).
-        """
+    def get_embedding(self, text: str) -> Optional[np.ndarray]:
+        """Get embedding for a single text, using cache if available."""
         text_hash = self._text_hash(text)
-
+        
         if text_hash in self.cache:
             return self.cache[text_hash]
-
-        # Check rate limit for real-time requests
-        if respect_rate_limit and not self.rate_limiter.acquire():
-            return None
-
+        
         try:
             response = self.client.embeddings.create(
                 input=text,
@@ -536,6 +474,9 @@ class MisinformationAnalyzer:
         # Build MisinfoCluster objects with generated labels
         clusters = []
         for cluster_id, notes_in_cluster in sorted(cluster_notes.items())[:CONFIG.MAX_CLUSTERS]:
+            # Convert numpy int64 to Python int for JSON serialization
+            cluster_id = int(cluster_id)
+            
             # Compute centroid
             embeddings = np.vstack([n.embedding for n in notes_in_cluster])
             centroid = np.mean(embeddings, axis=0)
@@ -855,17 +796,12 @@ async def analyze(payload: PostPayload):
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    rate_limit_stats = None
-    if state.analyzer and state.analyzer.embedding_service:
-        rate_limit_stats = state.analyzer.embedding_service.rate_limiter.get_stats()
-
     return {
         "status": "healthy" if state.initialized else "initializing",
         "initialized": state.initialized,
         "error": state.init_error,
         "clusters": len(state.analyzer.clusters) if state.analyzer else 0,
-        "labels": state.label_count,
-        "rate_limiter": rate_limit_stats
+        "labels": state.label_count
     }
 
 
