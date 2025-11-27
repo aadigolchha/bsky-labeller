@@ -17,6 +17,8 @@ Integration:
 - Called by Node.js jetstream.ts for each incoming post
 - Returns {label: string | null, score?: float, ...} format
 
+Author: Anthropic Claude
+License: MIT
 """
 
 import os
@@ -642,13 +644,14 @@ Respond with exactly one word: supports, refutes, or neutral"""
         
         # Check if similarity exceeds threshold
         if best_similarity < CONFIG.SIMILARITY_THRESHOLD:
+            logger.info(f"[FILTERED] Keyword match but low similarity ({best_similarity:.2f} < {CONFIG.SIMILARITY_THRESHOLD}): cluster='{best_cluster.label_id}', text='{text[:100]}...'")
             return None
         
         # Stance detection - only label if post supports the misinformation
         stance = self.detect_stance(text, best_cluster)
         
         if stance != 'supports':
-            logger.debug(f"Post matched cluster '{best_cluster.label_id}' but stance is '{stance}', not labeling")
+            logger.info(f"[STANCE] Matched '{best_cluster.label_id}' ({best_similarity:.2f}) but stance='{stance}', not labeling: '{text[:100]}...'")
             return None
         
         # Determine confidence level
