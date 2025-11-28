@@ -51,15 +51,15 @@ class Config:
     
     # Rate limit safety: process in small batches with delays
     EMBEDDING_BATCH_SIZE: int = 50  # Conservative batch size
-    LLM_BATCH_SIZE: int = 20  # Claims to extract per LLM call
-    LLM_DELAY_SECONDS: float = 0.1  # Delay between LLM calls
+    LLM_BATCH_SIZE: int = 10  # Claims to extract per LLM call
+    LLM_DELAY_SECONDS: float = 0.5  # Delay between LLM calls
     
     # Clustering
     CLUSTERING_EPS: float = float(os.getenv('CLUSTERING_EPS', '0.25'))  # Tighter clusters
     CLUSTERING_MIN_SAMPLES: int = int(os.getenv('CLUSTERING_MIN_SAMPLES', '2'))
     
     # Detection thresholds - HIGHER now that we're matching claims
-    SIMILARITY_THRESHOLD: float = float(os.getenv('SIMILARITY_THRESHOLD', '0.45'))  
+    SIMILARITY_THRESHOLD: float = float(os.getenv('SIMILARITY_THRESHOLD', '0.60'))  # Raised from 0.45
     HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv('HIGH_CONFIDENCE_THRESHOLD', '0.75'))
     
     # Data paths
@@ -263,18 +263,17 @@ class ClaimExtractor:
                 
                 logger.info(f"Extracted claims batch {batch_start//batch_size + 1}/{(len(uncached) + batch_size - 1)//batch_size}")
                 
+                # Save cache AFTER EACH BATCH to survive restarts
+                if new_cache_entries:
+                    cache.update(new_cache_entries)
+                    self._save_cache(cache)
+                
             except Exception as e:
                 logger.error(f"Claim extraction failed for batch: {e}")
             
             # Rate limit delay
             if batch_start + batch_size < len(uncached):
                 time.sleep(CONFIG.LLM_DELAY_SECONDS)
-        
-        # Update cache with new entries
-        if new_cache_entries:
-            cache.update(new_cache_entries)
-            self._save_cache(cache)
-            logger.info(f"Cached {len(new_cache_entries)} new claim extractions")
         
         return results
 
