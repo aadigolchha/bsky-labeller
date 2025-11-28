@@ -39,5 +39,7 @@ fi
 
 # Start Node immediately - it will handle requests while Python initializes
 # Python's /analyze endpoint returns {label: null} during initialization
+# Limit Node.js heap to 400MB to leave room for Python (~500MB)
 echo "🤖 Starting Node.js Server (Python still initializing in background)..."
+export NODE_OPTIONS="--max-old-space-size=400"
 exec npm start

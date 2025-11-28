@@ -246,16 +246,20 @@ class ClaimExtractor:
                 
                 extracted = json.loads(content)
                 
+                # Handle case where extracted is not a list
+                if not isinstance(extracted, list):
+                    extracted = [extracted] if extracted else []
+                
                 # Map results back
                 for item in extracted:
-                    if item is None:
+                    if item is None or not isinstance(item, dict):
                         continue
                     j = item.get("index")
                     if j is not None and 0 <= j < len(batch):
                         idx, note_id, summary, cache_key = batch[j]
                         result = {
-                            "false_claim": item.get("false_claim", ""),
-                            "keywords": item.get("keywords", [])[:10]  # Bound keywords
+                            "false_claim": item.get("false_claim", "") or "",
+                            "keywords": (item.get("keywords") or [])[:10]  # Bound keywords
                         }
                         if result["false_claim"]:
                             results[idx] = result
