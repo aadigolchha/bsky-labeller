@@ -796,12 +796,13 @@ class AnalyzerState:
     analyzer: Optional[MisinformationAnalyzer] = None
     initialized: bool = False
     init_error: Optional[str] = None
+    initializing: bool = False
 
 state = AnalyzerState()
 
 
-def initialize():
-    """Initialize the analyzer."""
+def initialize_sync():
+    """Initialize the analyzer (runs in background thread)."""
     logger.info("=" * 60)
     logger.info("MISINFORMATION ANALYZER v3 - CLAIM-BASED MATCHING")
     logger.info("=" * 60)
@@ -845,13 +846,22 @@ def initialize():
         return False
 
 
+def initialize_background():
+    """Start initialization in background thread."""
+    import threading
+    state.initializing = True
+    thread = threading.Thread(target=initialize_sync, daemon=True)
+    thread.start()
+
+
 # ============================================================================
 # FASTAPI APP
 # ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    initialize()
+    # Start initialization in background - don't block uvicorn startup
+    initialize_background()
     yield
     logger.info("Shutting down...")
 
@@ -881,8 +891,15 @@ async def analyze(payload: PostPayload):
 
 @app.get("/health")
 async def health():
+    if state.initialized:
+        status = "healthy"
+    elif state.initializing:
+        status = "initializing"
+    else:
+        status = "not_started"
+    
     return {
-        "status": "healthy" if state.initialized else "initializing",
+        "status": status,
         "initialized": state.initialized,
         "error": state.init_error,
         "clusters": len(state.analyzer.clusters) if state.analyzer else 0
