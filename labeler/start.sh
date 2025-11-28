@@ -15,36 +15,29 @@ python3 -m uvicorn logic.analyzer:app \
 
 PYTHON_PID=$!
 
-echo "⏳ Waiting for analyzer to initialize..."
+echo "⏳ Waiting for analyzer socket..."
 
-READY=false
-for i in {1..300}; do
+# Wait for socket file to exist (just the socket, not full init)
+for i in {1..60}; do
     if ! kill -0 $PYTHON_PID 2>/dev/null; then
-        echo "❌ Python analyzer died!"
+        echo "❌ Python analyzer died during socket creation!"
         exit 1
     fi
-
-    # Check if analyzer is actually ready (not just socket exists)
+    
     if [ -S /tmp/analyzer.sock ]; then
-        HEALTH=$(curl -s --unix-socket /tmp/analyzer.sock http://localhost/health 2>/dev/null || echo '{}')
-        if echo "$HEALTH" | grep -q '"initialized": true'; then
-            echo "✅ Analyzer ready after ${i}s"
-            READY=true
-            break
-        fi
+        echo "✅ Socket created after ${i}s"
+        break
     fi
-
-    if [ $((i % 10)) -eq 0 ]; then
-        echo "   Still initializing... (${i}s elapsed)"
-    fi
-
+    
     sleep 1
 done
 
-if [ "$READY" = false ]; then
-    echo "❌ Analyzer failed to initialize within 300s"
+if [ ! -S /tmp/analyzer.sock ]; then
+    echo "❌ Socket never created after 60s"
     exit 1
 fi
 
-echo "🤖 Starting Node.js Server..."
+# Start Node immediately - it will handle requests while Python initializes
+# Python's /analyze endpoint returns {label: null} during initialization
+echo "🤖 Starting Node.js Server (Python still initializing in background)..."
 exec npm start
