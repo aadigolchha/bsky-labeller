@@ -35,13 +35,13 @@ primary_region = "sjc"
     hard_limit = 100
     soft_limit = 50
 
-# Health check - give time for embedding initialization
+# Health check - @skyware/labeler uses /xrpc/_health
 [[http_service.checks]]
   interval = "30s"
   timeout = "10s"
-  grace_period = "180s"
+  grace_period = "60s"
   method = "GET"
-  path = "/"
+  path = "/xrpc/_health"
 
 # Machine configuration
 # Upgrade if you need more memory for large Community Notes datasets

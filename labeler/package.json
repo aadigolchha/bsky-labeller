@@ -5,6 +5,7 @@
     "@atproto/crypto": "^0.4.4",
     "@ipld/dag-cbor": "^9.2.5",
     "@skyware/jetstream": "^0.2.5",
+    "@skyware/labeler": "^0.2.0",
     "@types/ws": "^8.18.1",
     "better-sqlite3": "^12.4.6",
     "dotenv": "^17.2.3",

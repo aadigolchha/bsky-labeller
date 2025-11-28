@@ -1,6 +1,5 @@
-import express from "express";
-import http from "http";
 import dotenv from "dotenv";
+dotenv.config();
 
 // --- NUCLEAR FIX START ---
 import WebSocket from "ws";
@@ -9,14 +8,17 @@ import WebSocket from "ws";
 global.WebSocket = WebSocket;
 // --- NUCLEAR FIX END ---
 
+import { LabelerServer } from "@skyware/labeler";
 import { startJetstream } from "./jetstream.js";
-import { LabelerServer } from "./labeler-server.js";
-
-dotenv.config();
 
 // Validate required environment variables
 const LABELER_DID = process.env.LABELER_DID;
 const LABELER_PRIVATE_KEY = process.env.LABELER_PRIVATE_KEY;
+
+console.log("🔧 Starting Bluesky Labeler...");
+console.log(`   DID: ${LABELER_DID ? LABELER_DID.slice(0, 20) + '...' : 'NOT SET'}`);
+console.log(`   Key: ${LABELER_PRIVATE_KEY ? '***SET***' : 'NOT SET'}`);
+console.log(`   NODE_ENV: ${process.env.NODE_ENV}`);
 
 if (!LABELER_DID || !LABELER_DID.startsWith('did:')) {
   console.error("❌ FATAL: LABELER_DID must be set and start with 'did:' in .env");
@@ -28,28 +30,45 @@ if (!LABELER_PRIVATE_KEY) {
   process.exit(1);
 }
 
-const app = express();
-
-const server = http.createServer(app);
-
-// --- FIX: KEEP-ALIVE SETTINGS FOR FLY.IO---
-// Ensure Node waits longer than Fly's 60s proxy timeout
-server.keepAliveTimeout = 61 * 1000; // 61 seconds
-server.headersTimeout = 65 * 1000;   // 65 seconds (must be > keepAliveTimeout)
-// --------------------------------
-
 const PORT = parseInt(process.env.PORT || "8080", 10);
+const dbPath = process.env.NODE_ENV === 'production' ? '/data/labels.db' : './labels.db';
 
-const labeler = new LabelerServer(LABELER_DID);
+console.log(`   Port: ${PORT}`);
+console.log(`   DB Path: ${dbPath}`);
 
-app.get("/", (req, res) => {
-  res.send("Bluesky Labeler Running");
+// Use @skyware/labeler which properly handles label persistence and emission
+let server: LabelerServer;
+try {
+  console.log("🔧 Creating LabelerServer instance...");
+  server = new LabelerServer({
+    did: LABELER_DID,
+    signingKey: LABELER_PRIVATE_KEY,
+    dbPath: dbPath,
+  });
+  console.log("✅ LabelerServer instance created");
+} catch (err) {
+  console.error("❌ FATAL: Failed to create LabelerServer:", err);
+  process.exit(1);
+}
+
+// Start the labeler server
+console.log(`🔧 Calling server.start() on port ${PORT}...`);
+server.start({ port: PORT, host: "0.0.0.0" }, (error, address) => {
+  if (error) {
+    console.error("❌ Failed to start labeler server:", error);
+    process.exit(1);
+  }
+  console.log(`🚀 Labeler server listening on ${address}`);
+
+  // Start the Jetstream firehose consumer
+  startJetstream(server);
 });
 
-server.on("upgrade", (req, socket, head) => labeler.handleUpgrade(req, socket, head));
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err);
+});
 
-server.listen(PORT, "0.0.0.0", async () => {
-  await labeler.loadKey(LABELER_PRIVATE_KEY);
-  console.log(`Server running on port ${PORT}`);
-  startJetstream(labeler);
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });

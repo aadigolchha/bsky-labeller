@@ -39,7 +39,10 @@ fi
 
 # Start Node immediately - it will handle requests while Python initializes
 # Python's /analyze endpoint returns {label: null} during initialization
-# Limit Node.js heap to 400MB to leave room for Python (~500MB)
+# Memory management:
+# - Limit heap to 350MB to leave room for Python (~500MB) + system overhead
+# - Enable GC exposure so we can manually trigger garbage collection
+# - Enable low-memory mode to be more aggressive about cleanup
 echo "🤖 Starting Node.js Server (Python still initializing in background)..."
-export NODE_OPTIONS="--max-old-space-size=400"
+export NODE_OPTIONS="--max-old-space-size=350 --expose-gc --max-semi-space-size=32"
 exec npm start
