@@ -86,6 +86,31 @@ class Config:
 CONFIG = Config()
 
 # ============================================================================
+# LABEL MAPPING - Map cluster labels to simple Bluesky labels
+# ============================================================================
+
+# AI-related keywords that should map to "ai-generated" label
+AI_RELATED_KEYWORDS = ['ai-generated', 'ai-', 'deepfake', 'artificial', 'ai video', 'ai image']
+
+def map_to_simple_label(cluster_label: str, theme: Optional[str] = None) -> str:
+    """
+    Map cluster-specific labels to one of two simple labels:
+    - "ai-generated" for AI-related misinformation
+    - "misinformation" for everything else
+    """
+    label_lower = cluster_label.lower()
+    theme_lower = (theme or '').lower()
+
+    # Check if this is AI-related misinformation
+    for keyword in AI_RELATED_KEYWORDS:
+        if keyword in label_lower or keyword in theme_lower:
+            return 'ai-generated'
+
+    # Default to misinformation for all other clusters
+    return 'misinformation'
+
+
+# ============================================================================
 # DATA CLASSES (Memory-Bounded)
 # ============================================================================
 
@@ -751,12 +776,13 @@ class MisinformationAnalyzer:
                 best_similarity = sim
                 best_cluster = cluster
         
-        # Step 4: Check threshold
-        if best_similarity < CONFIG.SIMILARITY_THRESHOLD:
+        # Step 4: Check threshold - ensure best_cluster is not None
+        if best_cluster is None or best_similarity < CONFIG.SIMILARITY_THRESHOLD:
             self.stats["similarity_filtered"] += 1
+            cluster_name = best_cluster.label_id if best_cluster else "none"
             logger.info(
                 f"[FILTERED] similarity={best_similarity:.3f} < {CONFIG.SIMILARITY_THRESHOLD} | "
-                f"cluster='{best_cluster.label_id}' | text='{text[:100]}...'"
+                f"cluster='{cluster_name}' | text='{text[:100]}...'"
             )
             return None
         
@@ -764,20 +790,24 @@ class MisinformationAnalyzer:
         self.stats["labeled"] += 1
         is_high_confidence = best_similarity >= CONFIG.HIGH_CONFIDENCE_THRESHOLD
         confidence_marker = " ⚠️ HIGH CONFIDENCE" if is_high_confidence else ""
-        
+
+        # Map cluster label to simple Bluesky label
+        simple_label = map_to_simple_label(best_cluster.label_id, best_cluster.label_name)
+
         logger.info(
             f"[MATCH] similarity={best_similarity:.3f}{confidence_marker} | "
-            f"label='{best_cluster.label_id}' ({best_cluster.label_name}) | "
+            f"cluster='{best_cluster.label_id}' -> label='{simple_label}' | "
             f"text='{text[:100]}...'"
         )
-        
+
         return {
-            "label": best_cluster.label_id,
+            "label": simple_label,  # Return simple label: "misinformation" or "ai-generated"
+            "cluster_label": best_cluster.label_id,  # Keep cluster label for logging
             "score": float(best_similarity),
             "cluster_id": int(best_cluster.cluster_id),
             "theme": best_cluster.label_name,
             "severity": best_cluster.severity,
-            "high_confidence": bool(is_high_confidence),  # Convert numpy.bool_ to Python bool
+            "high_confidence": bool(is_high_confidence),
             "text": text[:200]
         }
     
