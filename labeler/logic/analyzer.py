@@ -51,15 +51,15 @@ class Config:
     
     # Rate limit safety: process in small batches with delays
     EMBEDDING_BATCH_SIZE: int = 50  # Conservative batch size
-    LLM_BATCH_SIZE: int = 10  # Claims to extract per LLM call
-    LLM_DELAY_SECONDS: float = 0.5  # Delay between LLM calls
+    LLM_BATCH_SIZE: int = 20  # Claims to extract per LLM call
+    LLM_DELAY_SECONDS: float = 0.1  # Delay between LLM calls
     
     # Clustering
     CLUSTERING_EPS: float = float(os.getenv('CLUSTERING_EPS', '0.25'))  # Tighter clusters
     CLUSTERING_MIN_SAMPLES: int = int(os.getenv('CLUSTERING_MIN_SAMPLES', '2'))
     
     # Detection thresholds - HIGHER now that we're matching claims
-    SIMILARITY_THRESHOLD: float = float(os.getenv('SIMILARITY_THRESHOLD', '0.60'))  # Raised from 0.45
+    SIMILARITY_THRESHOLD: float = float(os.getenv('SIMILARITY_THRESHOLD', '0.45'))  
     HIGH_CONFIDENCE_THRESHOLD: float = float(os.getenv('HIGH_CONFIDENCE_THRESHOLD', '0.75'))
     
     # Data paths
