@@ -774,10 +774,10 @@ class MisinformationAnalyzer:
         return {
             "label": best_cluster.label_id,
             "score": float(best_similarity),
-            "cluster_id": best_cluster.cluster_id,
+            "cluster_id": int(best_cluster.cluster_id),
             "theme": best_cluster.label_name,
             "severity": best_cluster.severity,
-            "high_confidence": is_high_confidence,
+            "high_confidence": bool(is_high_confidence),  # Convert numpy.bool_ to Python bool
             "text": text[:200]
         }
     
