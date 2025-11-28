@@ -75,6 +75,7 @@ class Config:
     MAX_CLUSTERS: int = int(os.getenv('MAX_CLUSTERS', '30'))
     MAX_KEYWORDS_PER_CLUSTER: int = 15
     MAX_CLAIMS_PER_CLUSTER: int = 5  # Sample claims to keep for context
+    MAX_EMBEDDING_CACHE_SIZE: int = int(os.getenv('MAX_EMBEDDING_CACHE_SIZE', '1000'))  # Max cached embeddings
     
     @classmethod
     def validate(cls) -> List[str]:
@@ -326,11 +327,19 @@ class EmbeddingService:
         self._load_cache()
     
     def _load_cache(self):
-        """Load embeddings cache from disk."""
+        """Load embeddings cache from disk, with size limit."""
         if self.cache_path.exists():
             try:
                 with open(self.cache_path, 'rb') as f:
-                    self._disk_cache = pickle.load(f)
+                    loaded = pickle.load(f)
+                # Limit cache size to prevent memory exhaustion
+                if len(loaded) > CONFIG.MAX_EMBEDDING_CACHE_SIZE:
+                    # Keep most recent entries (by keeping last N items)
+                    keys = list(loaded.keys())[-CONFIG.MAX_EMBEDDING_CACHE_SIZE:]
+                    self._disk_cache = {k: loaded[k] for k in keys}
+                    logger.info(f"Trimmed embedding cache from {len(loaded)} to {len(self._disk_cache)}")
+                else:
+                    self._disk_cache = loaded
                 logger.info(f"Loaded {len(self._disk_cache)} cached embeddings")
             except Exception as e:
                 logger.warning(f"Could not load embedding cache: {e}")
@@ -911,32 +920,53 @@ class PostPayload(BaseModel):
     did: str
 
 
+# Counter for periodic GC
+_analyze_count = 0
+_GC_EVERY_N_REQUESTS = 1000
+
 @app.post("/analyze")
 async def analyze(payload: PostPayload):
+    global _analyze_count
+
     if not state.initialized or not state.analyzer:
         return {"label": None, "error": state.init_error or "Not initialized"}
-    
+
     if not payload.text:
         return {"label": None}
-    
+
     result = state.analyzer.analyze_post(payload.text, payload.did)
+
+    # Periodic garbage collection to prevent memory buildup
+    _analyze_count += 1
+    if _analyze_count >= _GC_EVERY_N_REQUESTS:
+        _analyze_count = 0
+        gc.collect()
+
     return result if result else {"label": None}
 
 
 @app.get("/health")
 async def health():
+    import psutil
+
     if state.initialized:
         status = "healthy"
     elif state.initializing:
         status = "initializing"
     else:
         status = "not_started"
-    
+
+    # Get memory info
+    process = psutil.Process()
+    mem_info = process.memory_info()
+
     return {
         "status": status,
         "initialized": state.initialized,
         "error": state.init_error,
-        "clusters": len(state.analyzer.clusters) if state.analyzer else 0
+        "clusters": len(state.analyzer.clusters) if state.analyzer else 0,
+        "memory_mb": round(mem_info.rss / 1024 / 1024, 1),
+        "memory_percent": round(process.memory_percent(), 1)
     }
 
 
