@@ -22,34 +22,26 @@ primary_region = "sjc"
   source = "labeler_data"
   destination = "/data"
 
-# HTTP service configuration
-[[services]]
-  protocol = "tcp"
+# HTTP service configuration (modern syntax)
+[http_service]
   internal_port = 8080
-  
-  # Public ports
-  [[services.ports]]
-    port = 80
-    handlers = ["http"]
-    force_https = true
-  
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
 
-  # Health checks - give time for embedding initialization
-  [services.concurrency]
+  [http_service.concurrency]
     type = "connections"
     hard_limit = 100
     soft_limit = 50
 
-  # WebSocket keepalive
-  [[services.http_checks]]
-    interval = "30s"
-    timeout = "10s"
-    grace_period = "180s"  # 3 minutes for initial embedding generation
-    method = "GET"
-    path = "/"
+# Health check - give time for embedding initialization
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "10s"
+  grace_period = "180s"
+  method = "GET"
+  path = "/"
 
 # Machine configuration
 # Upgrade if you need more memory for large Community Notes datasets
