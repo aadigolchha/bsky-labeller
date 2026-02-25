@@ -211,3 +211,6 @@ __marimo__/
 node_modules/
 labeler/dist/
 labeler/.env
+
+labels.db-shm
+labels.db-wal

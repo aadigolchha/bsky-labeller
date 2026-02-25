@@ -10,6 +10,7 @@ global.WebSocket = WebSocket;
 
 import { LabelerServer } from "@skyware/labeler";
 import { startJetstream } from "./jetstream.js";
+import { startCallerServer } from "./caller/caller-listener.js";
 
 // Validate required environment variables
 const LABELER_DID = process.env.LABELER_DID;
@@ -31,9 +32,11 @@ if (!LABELER_PRIVATE_KEY) {
 }
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
+const CALLER_PORT = parseInt(process.env.CALLER_PORT || "8081", 10);
 const dbPath = process.env.NODE_ENV === 'production' ? '/data/labels.db' : './labels.db';
 
 console.log(`   Port: ${PORT}`);
+console.log(`   Caller Port: ${CALLER_PORT}`);
 console.log(`   DB Path: ${dbPath}`);
 
 // Use @skyware/labeler which properly handles label persistence and emission
@@ -62,6 +65,9 @@ server.start({ port: PORT, host: "0.0.0.0" }, (error, address) => {
 
   // Start the Jetstream firehose consumer
   startJetstream(server);
+
+  // Start standalone caller report server (bypasses Fastify integration issues)
+  startCallerServer(server, CALLER_PORT);
 });
 
 // Handle uncaught errors
